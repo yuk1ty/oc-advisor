@@ -1,6 +1,4 @@
-import type { Plugin, ToolContext } from "@opencode-ai/plugin";
-import { tool } from "@opencode-ai/plugin";
-import type { Part, TextPart } from "@opencode-ai/sdk";
+import { Plugin } from "@opencode/plugin";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
@@ -8,10 +6,8 @@ import type { AdvisorConfig } from "../../src/config";
 import { DEFAULT_ADVISOR_CONFIG, parseAdvisorConfig, parseAdvisorConfigJSON } from "../../src/config";
 import { parseModelID } from "../../src/model_id";
 import { RateLimiter } from "../../src/rate_limiter";
-import { extractTranscriptThenTruncate } from "../../src/transcript";
+import { extractTranscriptThenTruncate, type TranscriptMessage } from "../../src/transcript";
 import { buildAdvisorPrompt } from "../../src/prompt";
-
-const BLOCKED_TITLE = "Advisor blocked";
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -33,109 +29,108 @@ function readConfigFile(directory: string): AdvisorConfig {
   return DEFAULT_ADVISOR_CONFIG;
 }
 
-const advisor: Plugin = async ({ client, directory }, options) => {
-  const config: AdvisorConfig = isPlainObject(options)
-    ? parseAdvisorConfig(options)
-    : readConfigFile(directory);
-  const { providerID, modelID } = parseModelID(config.advisorModel);
-  const limiter = new RateLimiter(config.maxCallsPerSession);
+// V2 session messages are flat unions: user messages carry `text`, assistant
+// messages carry a `content` array of {type: "text" | "reasoning" | "tool", ...}.
+function toTranscript(messages: ReadonlyArray<unknown>): ReadonlyArray<TranscriptMessage> {
+  return messages
+    .map((m): TranscriptMessage | undefined => {
+      const msg = m as Record<string, unknown> | undefined;
+      if (msg === null || typeof msg !== "object") return undefined;
+      const role = typeof msg.type === "string" ? msg.type : "unknown";
+      let text = "";
+      if (typeof msg.text === "string") {
+        text = msg.text;
+      } else if (Array.isArray(msg.content)) {
+        text = msg.content
+          .map((p) => (p as Record<string, unknown> | undefined))
+          .filter((p): p is { type: "text"; text: string } => p !== null && typeof p === "object" && p.type === "text" && typeof p.text === "string")
+          .map((p) => p.text)
+          .join(" ");
+      }
+      const trimmed = text.trim();
+      return trimmed.length > 0 ? { info: { role }, parts: [{ type: "text", text: trimmed }] } : undefined;
+    })
+    .filter((m): m is TranscriptMessage => m !== undefined);
+}
 
-  const extractAdvisorText = (parts: ReadonlyArray<Part>): string =>
-    parts
-      .filter((p: Part): p is TextPart => p.type === "text")
-      .map((p) => p.text)
-      .join("\n")
-      .trim();
+export default Plugin.define({
+  id: "oc-advisor",
+  async setup(ctx) {
+    const hasOptions = isPlainObject(ctx.options) && Object.keys(ctx.options).length > 0;
+    const config: AdvisorConfig = hasOptions
+      ? parseAdvisorConfig(ctx.options)
+      : readConfigFile(ctx.location.directory);
+    const { providerID, modelID } = parseModelID(config.advisorModel);
+    const limiter = new RateLimiter(config.maxCallsPerSession);
 
-  return {
-    tool: {
-      ask_advisor: tool({
+    await ctx.tool.transform((editor) => {
+      editor.add({
+        name: "ask_advisor",
         description:
           "Consult a senior advisor model for strategic guidance, architecture review, a second opinion, or a course correction when you are stuck or unsure. Use this sparingly, only when a non-obvious design decision or hidden risk is in play. The advisor runs on a separate, higher-intelligence model and receives the current session transcript plus your question.",
-        args: {
-          question: tool.schema
-            .string()
-            .describe("The specific question or decision you want advice on. Be concrete."),
-          context: tool.schema
-            .string()
-            .optional()
-            .describe("Optional extra context: file paths, code snippets, prior decisions, or constraints the advisor should weigh."),
+        input: {
+          type: "object",
+          properties: {
+            question: {
+              type: "string",
+              description: "The specific question or decision you want advice on. Be concrete.",
+            },
+            context: {
+              type: "string",
+              description:
+                "Optional extra context: file paths, code snippets, prior decisions, or constraints the advisor should weigh.",
+            },
+          },
+          required: ["question"],
+          additionalProperties: false,
         },
-        async execute(args, ctx: ToolContext) {
-          const acquired = limiter.tryAcquire(ctx.sessionID);
+        async execute(input, toolCtx) {
+          const args = input as { question?: string; context?: string };
+          const question = typeof args.question === "string" ? args.question : "";
+          const extraContext = typeof args.context === "string" ? args.context : undefined;
+          if (question.length === 0) {
+            return {
+              content: "ask_advisor requires a non-empty 'question'.",
+            };
+          }
+
+          const acquired = limiter.tryAcquire(toolCtx.sessionID);
           if (!acquired.allowed) {
             return {
-              title: BLOCKED_TITLE,
-              output: `Advisor call limit (${config.maxCallsPerSession}) reached for this session. Raise "maxCallsPerSession" in .opencode/oc-advisor.json, or start a new session.`,
+              content: `Advisor call limit (${config.maxCallsPerSession}) reached for this session. Raise "maxCallsPerSession" in .opencode/oc-advisor.json, or start a new session.`,
             };
           }
-
-          const messagesResult = await client.session.messages({
-            path: { id: ctx.sessionID },
-          });
-          if (messagesResult.error) {
-            limiter.refund(ctx.sessionID);
-            return {
-              title: "Advisor error",
-              output: `Failed to read session transcript: ${String(messagesResult.error)}`,
-            };
-          }
-
-          const transcript = extractTranscriptThenTruncate(
-            messagesResult.data ?? [],
-            config.transcriptCharBudget,
-          );
-          const { system, user } = buildAdvisorPrompt({
-            transcript,
-            question: args.question,
-            context: args.context,
-          });
-
-          const sessionResult = await client.session.create({
-            body: { parentID: ctx.sessionID, title: "advisor" },
-          });
-          if (sessionResult.error) {
-            limiter.refund(ctx.sessionID);
-            return {
-              title: "Advisor error",
-              output: `Failed to open advisor session: ${String(sessionResult.error)}`,
-            };
-          }
-
-          const childID = sessionResult.data.id;
 
           try {
-            const promptResult = await client.session.prompt({
-              path: { id: childID },
-              body: {
-                model: { providerID, modelID },
-                system,
-                parts: [{ type: "text", text: user }],
-              },
+            const messages = await ctx.session.context({ sessionID: toolCtx.sessionID });
+            const transcript = extractTranscriptThenTruncate(
+              toTranscript(messages as ReadonlyArray<unknown>),
+              config.transcriptCharBudget,
+            );
+            const { system, user } = buildAdvisorPrompt({
+              transcript,
+              question,
+              context: extraContext,
             });
-            if (promptResult.error) {
-              limiter.refund(ctx.sessionID);
-              return {
-                title: "Advisor error",
-                output: `Advisor model (${config.advisorModel}) failed: ${String(promptResult.error)}`,
-              };
-            }
 
-            const text = extractAdvisorText(promptResult.data?.parts ?? []);
-            limiter.commit(ctx.sessionID);
+            const result = await ctx.experimental.generate.text({
+              model: { providerID, id: modelID },
+              prompt: `${system}\n\n---\n\n${user}`,
+            });
+
+            limiter.commit(toolCtx.sessionID);
+            const text = result.text.trim();
             return {
-              title: `Advisor Response (${config.advisorModel})`,
-              output: text.length > 0 ? text : "(advisor returned no text response)",
+              content: text.length > 0 ? text : "(advisor returned no text response)",
             };
-          } finally {
-            await client.session
-              .delete({ path: { id: childID } })
-              .catch(() => undefined);
+          } catch (error) {
+            limiter.refund(toolCtx.sessionID);
+            return {
+              content: `Advisor model (${config.advisorModel}) failed: ${String(error)}`,
+            };
           }
         },
-      }),
-    },
-  };
-};
-
-export default advisor;
+      });
+    });
+  },
+});
